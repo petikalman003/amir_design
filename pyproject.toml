@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amir-design"
+version = "0.1.0"
+description = "miR-E candidate design, shRNAI scoring, and SeedMatchR transcript screening"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy==1.26.4",
+  "pandas==2.2.3",
+  "streamlit==1.45.1",
+  "openpyxl==3.1.5",
+  "tensorflow-cpu==2.15.1",
+  "h5py==3.10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5", "ruff==0.11.13"]
+
+[tool.setuptools.packages.find]
+include = ["amir_design*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

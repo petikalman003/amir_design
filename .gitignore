@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local pipeline dependencies, species references, and run artifacts
+/tools/
+/data/
+/outputs/
+/.runtime/
