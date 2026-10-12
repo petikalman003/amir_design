@@ -76,7 +76,7 @@ def test_real_three_stage_pipeline_and_download(real_reference, real_dependencie
     assert row.off_target_genes == 2
     assert row.off_target_transcripts == row.off_target_sites == 3
     assert row.mer8_sites == 3
-    assert set(result.sites.gene_id) == {"TEST_OFF_GENE1", "TEST_OFF_GENE2"}
+    assert set(result.sites.to_frame().gene_id) == {"TEST_OFF_GENE1", "TEST_OFF_GENE2"}
     assert result.metadata["synthesis_status"] == "insert_available"
     assert len(row.mire_insert_dna_5to3) == 119
     assert row.mire_insert_dna_5to3[68:90] == row.guide_dna_5to3
@@ -134,6 +134,10 @@ def test_streamlit_real_submission_and_failed_submission_clear_old_result(
     workbook = openpyxl.load_workbook(BytesIO(app.session_state["workbook"]))
     assert "Candidate origins" in workbook.sheetnames
     assert workbook["Candidate origins"].max_row == 6
+    assert app.session_state["result"].metadata["off_target_site_details_retained"] is False
+    assert len(app.session_state["result"].sites) == 0
+    run_info = dict(workbook["Run information"].iter_rows(min_row=2, values_only=True))
+    assert run_info["report_detail_level"] == "summary"
     app.selectbox[-1].select("Isoform coverage").run()
     assert not app.exception and not app.error
     assert calls == {"score": 1, "screen": 1}
@@ -142,12 +146,25 @@ def test_streamlit_real_submission_and_failed_submission_clear_old_result(
     run_information = dict(sorted_workbook["Run information"].iter_rows(min_row=2, values_only=True))
     assert "coverage" in run_information["sort_order"].lower()
     assert sorted_workbook["Candidates"]["A2"].value == shared_row.candidate_id
+    app.button[1].click().run()
+    assert not app.exception and not app.error
+    assert calls == {"score": 1, "screen": 2}
+    detailed_path = Path(app.session_state["detailed_workbook"])
+    assert detailed_path.is_file()
+    detailed_workbook = openpyxl.load_workbook(detailed_path)
+    assert detailed_workbook["Off-target sites"].max_row > 1
+    app.selectbox[-1].select("Predicted activity").run()
+    assert not app.exception and not app.error
+    assert calls == {"score": 1, "screen": 2}
+    assert app.session_state["detailed_workbook"] == str(detailed_path)
+    assert app.session_state["detailed_workbook_sort"] == "Isoform coverage"
     app.checkbox[0].check()
     app.button[0].click().run()
     assert not app.exception and not app.error
     assert app.session_state["result"].metadata["require_all_isoforms"] is True
     assert len(app.session_state["result"].summary) == 1
     assert app.session_state["result"].summary.iloc[0].target_isoforms_covered == 2
+    assert not detailed_path.exists()
     app.text_input[0].set_value("INVALID_GENE_ID")
     app.button[0].click().run()
     assert not app.exception

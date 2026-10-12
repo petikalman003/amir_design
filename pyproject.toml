@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amir-design"
-version = "0.2.0"
+version = "0.2.1"
 description = "miR-E candidate design, shRNAI scoring, and SeedMatchR transcript screening"
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
   "pandas==2.2.3",
   "streamlit==1.45.1",
   "openpyxl==3.1.5",
+  "xlsxwriter==3.2.9",
   "tensorflow-cpu==2.15.1",
   "h5py==3.10.0",
 ]

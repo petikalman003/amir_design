@@ -5,14 +5,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import tempfile
+from time import monotonic
 
 import streamlit as st
+from xlsxwriter.exceptions import XlsxWriterException
 
 from amir_design.candidates import DESIGN_RULES, FIGURE_S1_RULES
 from amir_design.offtargets import SeedMatchRunner
-from amir_design.pipeline import run_identifier_pipeline, sort_result
+from amir_design.pipeline import run_identifier_pipeline, sort_result, with_site_details
 from amir_design.references import ReferenceBundle, ReferenceError
-from amir_design.reports import workbook_bytes
+from amir_design.reports import workbook_bytes, write_workbook
 from amir_design.scoring import ShRNAIScorer
 
 
@@ -28,6 +31,18 @@ SORT_LABELS = {
     "Isoform coverage": "coverage",
     "Lowest off-target gene count": "off_targets",
 }
+
+
+def elapsed_text(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60}m {seconds % 60}s" if seconds >= 60 else f"{seconds}s"
+
+
+def discard_detailed_workbook() -> None:
+    path = st.session_state.pop("detailed_workbook", None)
+    if path:
+        Path(path).unlink(missing_ok=True)
+    st.session_state.pop("detailed_workbook_sort", None)
 
 
 @st.cache_resource
@@ -110,6 +125,7 @@ def main() -> None:
 
     if submitted:
         # A failed or changed submission must not leave a previous result visible.
+        discard_detailed_workbook()
         st.session_state.pop("result", None)
         st.session_state.pop("workbook", None)
         st.session_state.pop("result_species", None)
@@ -120,19 +136,28 @@ def main() -> None:
         try:
             if not identifier.strip():
                 raise ValueError("Enter a target gene or transcript before designing guides.")
-            reference = get_reference(str(reference_root / species))
             scorer = CachedScorer(str(tools_root / "shrnai"))
             runner = SeedMatchRunner(tools_root / "seedmatchr", rscript=rscript_path())
             template_path = os.environ.get("AMIR_MIRE_TEMPLATE")
             with st.status("Preparing your candidates", expanded=True) as status:
+                started = monotonic()
+                progress_line = st.empty()
+
+                def show_progress(message: str) -> None:
+                    progress_line.write(f"{message} · {elapsed_text(monotonic() - started)} elapsed")
+
+                show_progress("Loading the selected reference")
+                reference = get_reference(str(reference_root / species))
                 result = run_identifier_pipeline(
                     identifier, reference, scorer, runner,
                     region=REGION_LABELS[region_label], require_all_isoforms=require_all,
                     profile=profile,
-                    progress=st.write,
+                    progress=show_progress,
                     template_path=Path(template_path) if template_path else None,
+                    include_site_details=False,
                 )
-                label = "No eligible candidate" if result.status == "no_eligible_candidate" else "Analysis complete"
+                label = ("No eligible candidate" if result.status == "no_eligible_candidate"
+                         else f"Analysis complete in {elapsed_text(monotonic() - started)}")
                 status.update(label=label, state="complete", expanded=False)
             st.session_state.result = result
             st.session_state.result_species = species
@@ -181,9 +206,6 @@ def main() -> None:
     sort_label = st.selectbox("Sort results by", list(SORT_LABELS), key="result_sort")
     order = SORT_LABELS[sort_label]
     displayed_result = sort_result(result, order=order)
-    if st.session_state.get("workbook_sort") != order:
-        st.session_state.workbook = workbook_bytes(displayed_result)
-        st.session_state.workbook_sort = order
     if result.status != "no_eligible_candidate":
         st.dataframe(
             displayed_result.summary, hide_index=True, use_container_width=True,
@@ -205,24 +227,82 @@ def main() -> None:
             },
         )
         st.caption("Scores are not knockdown percentages; seed counts indicate potential binding sites. "
-                   "The Excel download follows the selected sorting order.")
+                   "The summary download follows the selected sorting order.")
         if result.metadata.get("synthesis_status") == "template_required":
             st.warning("Mature guide sequences are available. Complete synthesis inserts require "
                        "a verified miR-E scaffold template.")
-        with st.expander("Off-target site details"):
-            st.dataframe(result.sites.head(10000), hide_index=True, use_container_width=True)
-            if len(result.sites) > 10000:
-                st.caption("Showing the first 10,000 sites. The download contains all sites.")
         with st.expander("Target isoform sites and candidate origins"):
             st.write("Exact target-site occurrences across the gene's transcripts")
             st.dataframe(result.on_target_sites, hide_index=True, use_container_width=True)
             st.write("Sites used to generate candidates in the selected search region")
             st.dataframe(result.candidate_origins, hide_index=True, use_container_width=True)
+    if st.session_state.get("workbook_sort") != order:
+        st.session_state.workbook = workbook_bytes(
+            displayed_result, include_off_target_sites=False,
+        )
+        st.session_state.workbook_sort = order
+    st.caption("The summary contains every candidate, exact off-target counts, isoform coverage, "
+               "and synthesis sequences. Individual off-target positions are an optional export.")
     st.download_button(
         "Download results and sequences", data=st.session_state.workbook,
         file_name=f"amir_{species}_{gene_name}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    if result.status != "no_eligible_candidate":
+        site_count = int(result.summary.off_target_sites.sum())
+        st.caption(f"The detailed workbook adds all {site_count:,} individual off-target "
+                   "sites. Preparing it can take longer and create a large file.")
+        if st.button("Prepare detailed workbook"):
+            discard_detailed_workbook()
+            descriptor, name = tempfile.mkstemp(prefix="amir-detailed-", suffix=".xlsx")
+            os.close(descriptor)
+            export_ready = False
+            try:
+                with st.status("Preparing detailed workbook", expanded=True) as report_status:
+                    report_progress = st.empty()
+                    report_started = monotonic()
+
+                    def show_report_progress(message: str) -> None:
+                        report_progress.write(
+                            f"{message} · {elapsed_text(monotonic() - report_started)} elapsed"
+                        )
+
+                    reference = get_reference(str(reference_root / species))
+                    runner = SeedMatchRunner(tools_root / "seedmatchr", rscript=rscript_path())
+                    result = with_site_details(
+                        result, reference, runner, progress=show_report_progress,
+                    )
+                    st.session_state.result = result
+                    detailed_result = sort_result(result, order=order)
+                    write_workbook(detailed_result, Path(name), progress=show_report_progress)
+                    report_status.update(label="Detailed workbook ready", state="complete",
+                                         expanded=False)
+                st.session_state.detailed_workbook = name
+                st.session_state.detailed_workbook_sort = sort_label
+                export_ready = True
+            except (ValueError, RuntimeError, OSError, XlsxWriterException) as exc:
+                st.error(f"Could not prepare the detailed workbook: {exc}")
+            finally:
+                # Streamlit cancellation and rerun exceptions must also remove partial files.
+                if not export_ready:
+                    Path(name).unlink(missing_ok=True)
+        detailed_path = st.session_state.get("detailed_workbook")
+        if detailed_path:
+            st.caption(f"Detailed workbook order: {st.session_state.detailed_workbook_sort}. "
+                       "Changing the table sorting keeps this prepared file; prepare it again "
+                       "to change its order.")
+            with Path(detailed_path).open("rb") as report_file:
+                st.download_button(
+                    "Download detailed workbook", data=report_file,
+                    file_name=f"amir_{species}_{gene_name}_detailed.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        if result.metadata.get("off_target_site_details_retained"):
+            with st.expander("Off-target site details"):
+                st.dataframe(result.sites.head(10000), hide_index=True, use_container_width=True)
+                if len(result.sites) > 10000:
+                    st.caption("Showing the first 10,000 sites. The detailed workbook contains "
+                               "every site.")
 
 
 if __name__ == "__main__":

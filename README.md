@@ -5,8 +5,10 @@ A Streamlit workflow connecting the uploaded Design.py selection rules,
 [SeedMatchR](https://github.com/tacazares/SeedMatchR) full-transcript seed screening.
 Enter a gene or transcript ID, select Human or Mouse and a search region, and
 download one Excel workbook containing candidate guides, predicted scores,
-off-target sites, target isoform coverage, candidate origins, and reference/model
-provenance. CDS, 3′ UTR, 5′ UTR, and whole mature transcript searches are supported.
+exact off-target counts, target isoform coverage, candidate origins, and
+reference/model provenance. Individual off-target positions are available in an
+optional detailed workbook. CDS, 3′ UTR, 5′ UTR, and whole mature transcript
+searches are supported.
 
 ## Run
 
@@ -41,7 +43,19 @@ data.
    least one annotated transcript, or check it to require every transcript.
 4. Select the design-rule profile and click **Design and screen**.
 5. Sort the results by predicted activity, isoform coverage, or off-target gene
-   count, then download the workbook. Changing the result sort reuses the analysis.
+   count, then click **Download results and sequences** for the summary workbook.
+   Changing the result sort reuses the analysis.
+6. If you need individual off-target positions, click **Prepare detailed workbook**,
+   wait for preparation to finish, then click **Download detailed workbook**.
+
+Analysis progress shows the current stage, guides screened, and elapsed time. The
+default summary includes every eligible candidate and exact counts from the full
+species reference. It does not write millions of individual off-target positions
+before showing your scores. The first detailed preparation performs the exact
+screen again to retain every position, verifies that the counts agree with the
+summary, and adds all positions to the same candidate/sequence report. Later
+exports reuse retained positions. Preparing a detailed workbook can take longer
+and produce a large file.
 
 A gene ID generates candidates across all its isoforms. A transcript ID generates
 candidates from that transcript only; coverage still uses every transcript of its
@@ -131,6 +145,11 @@ stored transcripts and does not replace the base reference bundle.
 - The actual pinned SeedMatchR `get_seed()` and `SeedMatchR()` sequence functions
   are sourced in R. Unrelated RNA-seq report/annotation dependencies are not
   installed. No DESeq2 or experimental expression data is required.
+- A batched Biostrings `PDict` exact-seed prefilter identifies transcripts that
+  contain each requested seed before the unchanged upstream SeedMatchR function
+  determines the final coordinates. The prefilter is lossless: it excludes only
+  transcripts with no exact match and preserves full-reference results. Shared
+  patterns are indexed together instead of repeatedly scanning every transcript.
 - Exact `mer8`, `mer7m8`, and `mer7A1` seed matches are searched across complete
   spliced transcripts. Mismatches, indels, and wobble matches are disabled.
   Six-base searches are supported by the adapter but excluded from the default
@@ -144,9 +163,12 @@ stored transcripts and does not replace the base reference bundle.
 
 The default report sorts by predicted activity descending. Users can instead
 sort by isoform coverage descending or off-target gene count ascending, with
-deterministic tie-breaking. The selected sort applies to the downloadable report
-and does not rerun scoring or screening. These are separate metrics, with no
-arbitrary combined score.
+deterministic tie-breaking. The selected sort applies to the summary download and
+does not rerun scoring or screening. A prepared detailed workbook retains the
+order selected when it was created; the app displays that saved order. Changing
+the table sort leaves the large detailed file intact. Click **Prepare detailed
+workbook** again to regenerate it with the newly selected order. These are
+separate metrics, with no arbitrary combined score.
 
 ## miR-E synthesis output
 
@@ -213,8 +235,26 @@ archives. Both examples passed scoring and full-reference screening. Their short
 seed matches are plentiful; these examples demonstrate operation rather than
 endorsing either guide as a suitable experimental choice.
 
-Large screens can produce millions of transcript sites. Workbook generation
-streams rows and splits sheets at Excel's row limit. The R/Python screening
-stage still materializes hit tables. Large candidate batches need sufficient RAM;
-reference preparation and representative screens do not benchmark every gene or
-the largest possible candidate set.
+Version 0.2.1 separates exact-count analysis from optional site-detail export.
+On the validation machine, a complete Mouse Fpgs whole-transcript app submission
+finished in 96 seconds: 113 guides, ten target isoforms, and 6,189,434 off-target
+sites summed across guides using the complete M36 reference. The summary workbook
+was about 50 KB, and changing its sorting took under a second without rerunning
+the analysis. Runtime on another computer will depend on its hardware.
+
+Every eligible candidate is still scored and screened across the full reference;
+there is no candidate cutoff or hit-count cap. The default analysis retains exact
+gene, transcript, and site counts without transferring all position rows to
+Python. R processes one guide's hits at a time instead of accumulating all
+candidates' hits. The full transcript reference remains loaded in R, so adequate
+RAM is still required.
+
+Detailed position rows are stored on disk and streamed into a constant-memory
+XlsxWriter workbook, splitting sheets at Excel's row limit. Long cell values are
+preserved in ordered parts rather than truncated. The browser preview shows the
+first 10,000 positions, while the detailed download contains every position.
+Large exports require disk space and can still take minutes; serving the final
+download also uses memory. The summary records that individual positions were
+omitted and retains their exact total, rather than presenting omitted rows as
+zero hits. Reference preparation and representative screens do not benchmark
+every gene or the largest possible candidate set.

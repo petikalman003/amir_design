@@ -7,7 +7,9 @@ import pandas as pd
 import pytest
 
 from amir_design.candidates import reverse_complement
-from amir_design.pipeline import PipelineResult, run_identifier_pipeline, run_pipeline, sort_result
+from amir_design.pipeline import (
+    PipelineResult, run_identifier_pipeline, run_pipeline, sort_result, with_site_details,
+)
 from amir_design.reports import workbook_bytes
 
 
@@ -41,13 +43,16 @@ class ScorerFixture:
 
 
 class RunnerFixture:
-    def screen(self, guides, fasta, gene, mapping):
+    def screen(self, guides, fasta, gene, mapping, *, progress=None, include_sites=True):
         assert guides == {"amiR_0001": reverse_complement(TARGET)}
         assert gene == "target"
+        if progress:
+            progress("Screening guide 1/1")
         return SimpleNamespace(
             summary={"amiR_0001": {"off_target_genes": 1, "off_target_transcripts": 1,
                                     "off_target_sites": 1}},
-            sites=[{"candidate_id": "amiR_0001", "gene_id": "other", "transcript_id": "off1"}],
+            sites=([{"candidate_id": "amiR_0001", "gene_id": "other", "transcript_id": "off1"}]
+                   if include_sites else []),
             provenance={"kind": "test stub"},
         )
 
@@ -97,6 +102,7 @@ def test_report_records_insert_provenance_and_literal_external_strings(monkeypat
     )
     result.metadata["target_gene_name"] = "=SOME_EXTERNAL_IDENTIFIER"
     result.sites = pd.DataFrame({"gene_id": ["=literal", "+literal", "@literal", "-literal"]})
+    result.summary.loc[:, "off_target_sites"] = 4
     monkeypatch.setattr(reports, "MAX_DATA_ROWS", 2)
     workbook = openpyxl.load_workbook(BytesIO(workbook_bytes(result)))
     assert "Off-target sites 2" in workbook.sheetnames
@@ -107,7 +113,7 @@ def test_report_records_insert_provenance_and_literal_external_strings(monkeypat
 
 def test_stage_failure_is_not_reported_as_zero_offtargets():
     class BrokenRunner:
-        def screen(self, *args):
+        def screen(self, *args, **kwargs):
             raise RuntimeError("R search failed")
 
     with pytest.raises(RuntimeError, match="R search failed"):
@@ -211,7 +217,7 @@ def test_gene_sources_include_each_isoform_but_transcript_sources_only_selected_
             return [0.8] * len(targets)
 
     class Runner:
-        def screen(self, guides, fasta, gene, mapping):
+        def screen(self, guides, fasta, gene, mapping, *, progress=None, include_sites=True):
             assert gene == "target"
             return SimpleNamespace(
                 summary={candidate: {"off_target_genes": 0, "off_target_transcripts": 0,
@@ -229,6 +235,53 @@ def test_gene_sources_include_each_isoform_but_transcript_sources_only_selected_
     transcript_result = run_identifier_pipeline("tx1", DifferentIsoforms(), Scorer(), Runner())
     assert list(transcript_result.summary.target_site_dna_5to3) == [TARGET]
     assert transcript_result.summary.iloc[0].target_isoforms_total == 2
+
+
+def test_pipeline_reports_stage_timing_and_forwards_per_guide_progress():
+    messages = []
+    result = run_pipeline(
+        TARGET, ReferenceFixture(), ScorerFixture(), RunnerFixture(), progress=messages.append,
+    )
+    assert "Screening guide 1/1" in messages
+    assert messages[-1] == "Assembling candidate sequences and isoform coverage results"
+    assert set(result.metadata["stage_duration_seconds"]) == {
+        "candidate_selection", "shrnai", "seedmatchr", "result_assembly",
+    }
+    assert result.metadata["analysis_duration_seconds"] >= 0
+
+
+def test_optional_site_positions_do_not_change_counts_or_repeat_scoring():
+    reference = ReferenceFixture()
+    result = run_pipeline(
+        TARGET, reference, ScorerFixture(), RunnerFixture(), include_site_details=False,
+    )
+    assert result.sites.empty
+    assert result.summary.iloc[0].off_target_sites == 1
+    assert result.metadata["off_target_site_details_retained"] is False
+    detailed = with_site_details(result, reference, RunnerFixture())
+    assert len(detailed.sites) == 1
+    pd.testing.assert_frame_equal(detailed.summary, result.summary)
+    pd.testing.assert_frame_equal(detailed.on_target_sites, result.on_target_sites)
+    assert detailed.metadata["detailed_screen_counts_verified"] is True
+    assert with_site_details(detailed, object(), object()) is detailed
+
+
+def test_detailed_export_rejects_inconsistent_counter_instead_of_changing_results():
+    reference = ReferenceFixture()
+    result = run_pipeline(
+        TARGET, reference, ScorerFixture(), RunnerFixture(), include_site_details=False,
+    )
+
+    class ChangedRunner(RunnerFixture):
+        def screen(self, *args, **kwargs):
+            response = super().screen(*args, **kwargs)
+            response.summary["amiR_0001"]["off_target_genes"] += 1
+            return response
+
+    with pytest.raises(RuntimeError, match="changed off_target_genes"):
+        with_site_details(result, reference, ChangedRunner())
+    assert result.metadata["off_target_site_details_retained"] is False
+    assert result.sites.empty
 
 
 def test_sorting_changes_independent_order_and_report_without_changing_measurements():

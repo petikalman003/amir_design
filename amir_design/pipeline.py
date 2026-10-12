@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
 
 import pandas as pd
@@ -31,7 +32,7 @@ SUMMARY_COLUMNS = [
 class PipelineResult:
     status: str
     summary: pd.DataFrame
-    sites: pd.DataFrame
+    sites: Any
     on_target_sites: pd.DataFrame
     metadata: dict[str, Any]
     notices: list[str] = field(default_factory=list)
@@ -74,6 +75,56 @@ def sort_result(result: PipelineResult, order: str = "activity") -> PipelineResu
     return replace(result, summary=summary, metadata=metadata)
 
 
+def _site_data(sites: Any) -> Any:
+    from amir_design.offtargets import OffTargetSiteStore
+
+    return sites if isinstance(sites, OffTargetSiteStore) else pd.DataFrame(sites)
+
+
+def with_site_details(
+    result: PipelineResult,
+    reference: Any,
+    seed_runner: Any,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> PipelineResult:
+    """Retrieve optional positions without repeating scoring or changing any counts."""
+    if result.summary.empty or result.metadata.get("off_target_site_details_retained"):
+        return result
+    notify = progress or (lambda message: None)
+    guides = dict(zip(result.summary.candidate_id, result.summary.guide_dna_5to3, strict=True))
+    notify(f"Retrieving individual off-target sites for {len(guides)} guides")
+    started = perf_counter()
+    details = seed_runner.screen(
+        guides, reference.fasta_path, result.metadata["target_gene_id"],
+        reference.transcript_gene_map(), progress=notify, include_sites=True,
+    )
+    expected = result.summary.set_index("candidate_id")
+    counter_names = {
+        name for name in expected.columns
+        if name.startswith("off_target_") or name.endswith("_sites")
+    }
+    if set(details.summary) != set(expected.index):
+        raise RuntimeError("Detailed screening returned a different set of candidates.")
+    for candidate_id, counts in details.summary.items():
+        if set(counts) != counter_names:
+            raise RuntimeError("Detailed screening returned a different set of off-target counters.")
+        for name, count in counts.items():
+            if name not in expected.columns or int(expected.at[candidate_id, name]) != count:
+                raise RuntimeError(
+                    f"Detailed screening changed {name} for {candidate_id}; "
+                    "the workbook was not exported."
+                )
+    metadata = {
+        **result.metadata,
+        "off_target_site_details_retained": True,
+        "detailed_screen_duration_seconds": round(perf_counter() - started, 3),
+        "detailed_screen_counts_verified": True,
+        "detailed_screen_seedmatchr": details.provenance,
+    }
+    return replace(result, sites=_site_data(details.sites), metadata=metadata)
+
+
 def _selection_metadata(reference: Any, gene: dict, selection: CandidateSelection) -> dict[str, Any]:
     return {
         "application_version": __version__,
@@ -107,9 +158,11 @@ def run_pipeline(
     template_path: Path | None = None,
     require_all_isoforms: bool = True,
     sort_by: str = "activity",
+    include_site_details: bool = True,
 ) -> PipelineResult:
     """Keep the original pasted-CDS entry point and complete-coverage default."""
     notify = progress or (lambda message: None)
+    started = perf_counter()
     cds = normalize_cds(cds_text)
     notify("Identifying the target gene in the selected reference")
     gene = reference.gene_for_cds(cds)
@@ -129,6 +182,8 @@ def run_pipeline(
         selection, transcripts, gene, reference, scorer, seed_runner, metadata,
         notify=notify, insert_builder=insert_builder, scaffold_provenance=scaffold_provenance,
         template_path=template_path, sort_by=sort_by,
+        started=started,
+        include_site_details=include_site_details,
     )
 
 
@@ -146,11 +201,13 @@ def run_identifier_pipeline(
     insert_builder: Callable[[str], str] | None = None,
     scaffold_provenance: dict[str, Any] | None = None,
     template_path: Path | None = None,
+    include_site_details: bool = True,
 ) -> PipelineResult:
     """Generate from a gene or transcript ID, retaining the full-gene denominator."""
     if region not in {"cds", "utr3", "utr5", "whole"}:
         raise ValueError(f"Unknown search region: {region}")
     notify = progress or (lambda message: None)
+    started = perf_counter()
     notify("Finding the gene or transcript in the selected reference")
     gene = reference.resolve_identifier(identifier)
     transcripts = reference.transcripts_for_gene(gene["gene_id"])
@@ -186,6 +243,8 @@ def run_identifier_pipeline(
         selection, transcripts, gene, reference, scorer, seed_runner, metadata,
         notify=notify, insert_builder=insert_builder, scaffold_provenance=scaffold_provenance,
         template_path=template_path, sort_by=sort_by,
+        started=started,
+        include_site_details=include_site_details,
     )
 
 
@@ -203,6 +262,8 @@ def _run_selected_pipeline(
     scaffold_provenance: dict[str, Any] | None,
     template_path: Path | None,
     sort_by: str,
+    started: float,
+    include_site_details: bool,
 ) -> PipelineResult:
     """Run all stages; unavailable or failed stages raise rather than invent data.
 
@@ -216,7 +277,10 @@ def _run_selected_pipeline(
     if sort_by not in _SORT_ORDERS:
         raise ValueError(f"Unknown candidate sort: {sort_by}")
     metadata.update({"sort_by": sort_by, "sort_order": _SORT_ORDERS[sort_by][2]})
+    stage_times = {"candidate_selection": round(perf_counter() - started, 3)}
     if not selection.candidates:
+        metadata["stage_duration_seconds"] = stage_times
+        metadata["analysis_duration_seconds"] = round(perf_counter() - started, 3)
         metadata["stages"] = {
             "candidate_selection": "completed",
             "shrnai": "not run: no eligible candidate",
@@ -252,18 +316,27 @@ def _run_selected_pipeline(
     elif scaffold_provenance is None and insert_builder is None and DEFAULT_MIRE_TEMPLATE is not None:
         scaffold_provenance = DEFAULT_MIRE_TEMPLATE.provenance
     notify(f"Predicting efficiency for {len(candidates)} eligible guides")
+    stage_started = perf_counter()
     scores = scorer.score([candidate.target_sequence for candidate in candidates])
+    stage_times["shrnai"] = round(perf_counter() - stage_started, 3)
     if len(scores) != len(candidates):
         raise RuntimeError("Efficiency scoring returned an inconsistent candidate count.")
     metadata["shrnai"] = scorer.provenance
-    notify("Screening guide seeds across full transcripts")
+    notify(f"Screening {len(candidates)} guide seeds across full transcripts")
+    stage_started = perf_counter()
     off_targets = seed_runner.screen(
         {candidate.candidate_id: candidate.guide_dna for candidate in candidates},
         reference.fasta_path,
         gene["gene_id"],
         reference.transcript_gene_map(),
+        progress=notify,
+        include_sites=include_site_details,
     )
+    stage_times["seedmatchr"] = round(perf_counter() - stage_started, 3)
+    notify("Assembling candidate sequences and isoform coverage results")
+    stage_started = perf_counter()
     metadata["seedmatchr"] = off_targets.provenance
+    metadata["off_target_site_details_retained"] = include_site_details
     metadata["site_coordinates"] = "1-based inclusive positions within full spliced transcripts"
     if scaffold_provenance is not None:
         metadata["synthesis_scaffold"] = scaffold_provenance
@@ -336,10 +409,13 @@ def _run_selected_pipeline(
         "candidate_selection": "completed", "shrnai": "completed", "seedmatchr": "completed",
         "synthesis": "template required" if synthesis_missing else "declared template assembled",
     }
+    stage_times["result_assembly"] = round(perf_counter() - stage_started, 3)
+    metadata["stage_duration_seconds"] = stage_times
+    metadata["analysis_duration_seconds"] = round(perf_counter() - started, 3)
     return PipelineResult(
         status="analysis_complete" if synthesis_missing else "complete",
         summary=summary,
-        sites=pd.DataFrame(off_targets.sites),
+        sites=_site_data(off_targets.sites),
         on_target_sites=pd.DataFrame(target_rows),
         metadata=metadata,
         candidate_origins=pd.DataFrame(origin_rows),

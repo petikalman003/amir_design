@@ -14,7 +14,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Mapping, Sequence
+import time
+from typing import Callable, Iterator, Mapping, Sequence
 
 
 SEEDMATCHR_COMMIT = "2fc0c4fba31e7306377488ac8b4c81d6445df5e2"
@@ -25,8 +26,87 @@ SEED_PRIORITY = {"mer8": 0, "mer7m8": 1, "mer7A1": 2, "mer6": 3}
 @dataclass(frozen=True)
 class OffTargetResult:
     summary: dict[str, dict[str, int]]
-    sites: list[dict[str, str | int]]
+    sites: list[dict[str, str | int]] | OffTargetSiteStore
     provenance: dict[str, str]
+
+
+SITE_COLUMNS = (
+    "candidate_id", "transcript_id", "start", "end", "width", "g2_position",
+    "seed_class", "target_sequence", "gene_id",
+)
+_INTEGER_SITE_COLUMNS = frozenset(("start", "end", "width", "g2_position"))
+
+
+class OffTargetSiteStore:
+    """Complete site rows held on disk, with bounded-memory preview and export.
+
+    The temporary directory remains alive for as long as this result exists.
+    Iteration opens the TSV afresh, so sorting summaries or exporting again does
+    not consume the store. No search result is truncated.
+    """
+
+    columns = SITE_COLUMNS
+
+    def __init__(
+        self, path: Path, row_count: int, *, owner: tempfile.TemporaryDirectory | None = None,
+    ):
+        self.path = Path(path)
+        self.row_count = row_count
+        self._owner = owner
+
+    def __len__(self) -> int:
+        return self.row_count
+
+    @property
+    def empty(self) -> bool:
+        return self.row_count == 0
+
+    def iter_dicts(self) -> Iterator[dict[str, str | int]]:
+        with self.path.open(newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if tuple(reader.fieldnames or ()) != self.columns:
+                raise RuntimeError("Off-target site file has unexpected columns")
+            for raw in reader:
+                yield {field: int(value) if field in _INTEGER_SITE_COLUMNS else value
+                       for field, value in raw.items()}
+
+    def iter_rows(self) -> Iterator[tuple[str | int, ...]]:
+        for row in self.iter_dicts():
+            yield tuple(row[column] for column in self.columns)
+
+    def __iter__(self) -> Iterator[dict[str, str | int]]:
+        return self.iter_dicts()
+
+    def __getitem__(self, index: int) -> dict[str, str | int]:
+        if index < 0:
+            index += self.row_count
+        if not 0 <= index < self.row_count:
+            raise IndexError(index)
+        for offset, row in enumerate(self.iter_dicts()):
+            if offset == index:
+                return row
+        raise RuntimeError("Off-target site file is shorter than its recorded count")
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, list):
+            return len(other) == self.row_count and all(
+                row == expected for row, expected in zip(self, other, strict=True)
+            )
+        return self is other
+
+    def to_frame(self, limit: int | None = None):
+        import itertools
+        import pandas as pd
+
+        if limit is not None and limit < 0:
+            raise ValueError("Preview limit must be nonnegative")
+        rows = self.iter_rows()
+        if limit is not None:
+            rows = itertools.islice(rows, limit)
+        return pd.DataFrame.from_records(rows, columns=self.columns)
+
+    def head(self, n: int = 5):
+        return self.to_frame(limit=n)
 
 
 def _identifier(value: str, name: str) -> str:
@@ -136,13 +216,17 @@ class SeedMatchRunner:
         seed_classes: Sequence[str] = DEFAULT_SEED_CLASSES,
         include_sites: bool = True,
         timeout: int = 3600,
+        progress: Callable[[str], None] | None = None,
     ) -> OffTargetResult:
         """Search exact canonical guide seeds over full spliced transcripts.
 
         Guides are mature 22-nt strands in 5' to 3' orientation; DNA or RNA text
         is accepted. All transcripts of the intended gene are excluded. The
         returned site count is a transcript-site count, not a genomic-site or
-        experimentally established off-target count.
+        experimentally established off-target count. Counts-only mode still searches
+        every requested seed against the complete reference; it only avoids writing
+        the potentially millions of detailed site rows. Progress is emitted as
+        each guide completes.
         """
         _identifier(target_gene_id, "Target gene")
         seed_classes = tuple(dict.fromkeys(seed_classes))
@@ -189,42 +273,97 @@ class SeedMatchRunner:
         if target_gene_id not in {transcript_gene_map[tx] for tx in fasta_ids}:
             raise ValueError(f"Target gene is absent from the reference: {target_gene_id}")
         self._check_runtime()
+        bridge_source = self.bridge.read_bytes()
         provenance.update({
             "get_seed_sha256": hashlib.sha256((self.repo_path / "R/get_seed.R").read_bytes()).hexdigest(),
             "seedmatchr_api_sha256": hashlib.sha256((self.repo_path / "R/SeedMatchR.R").read_bytes()).hexdigest(),
-            "bridge_sha256": hashlib.sha256(self.bridge.read_bytes()).hexdigest(),
+            "bridge_sha256": hashlib.sha256(bridge_source).hexdigest(),
         })
-        with tempfile.TemporaryDirectory(prefix="amir-seedmatch-") as tmp:
-            temporary = Path(tmp)
-            candidates_file = temporary / "candidates.tsv"
-            sites_file = temporary / "sites.tsv"
-            info_file = temporary / "provenance.tsv"
+        owner = tempfile.TemporaryDirectory(prefix="amir-seedmatch-")
+        temporary = Path(owner.name)
+        candidates_file = temporary / "candidates.tsv"
+        sites_file = temporary / "sites.tsv"
+        info_file = temporary / "provenance.tsv"
+        mapping_file = temporary / "mapping.tsv"
+        summary_file = temporary / "summary.tsv"
+        progress_file = temporary / "progress.txt"
+        output_file = temporary / "runtime.log"
+        bridge_file = temporary / "seedmatch.R"
+        try:
+            bridge_file.write_bytes(bridge_source)
             with candidates_file.open("w", newline="") as handle:
                 writer = csv.writer(handle, delimiter="\t")
                 writer.writerow(("candidate_id", "guide"))
                 writer.writerows(normalized.items())
+            with mapping_file.open("w", newline="") as handle:
+                writer = csv.writer(handle, delimiter="\t")
+                writer.writerow(("transcript_id", "gene_id"))
+                writer.writerows((tx, transcript_gene_map[tx]) for tx in fasta_ids)
             command = [
-                self.rscript, "--vanilla", str(self.bridge), str(self.repo_path),
+                self.rscript, "--vanilla", str(bridge_file), str(self.repo_path),
                 str(candidates_file), str(reference_fasta), str(sites_file),
-                str(info_file), ",".join(seed_classes),
+                str(info_file), ",".join(seed_classes), str(mapping_file), target_gene_id,
+                str(summary_file), str(progress_file), "sites" if include_sites else "summary",
             ]
-            try:
-                completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(f"SeedMatchR exceeded its {timeout}-second time limit") from exc
-            except OSError as exc:
-                raise RuntimeError(f"Could not start SeedMatchR: {exc}") from exc
-            if completed.returncode:
-                detail = (completed.stderr or completed.stdout).strip()[-4000:]
-                raise RuntimeError(f"SeedMatchR failed: {detail}")
-            if not sites_file.is_file() or not info_file.is_file():
+            self._run_bridge(command, output_file, progress_file, timeout, progress)
+            if not all(path.is_file() for path in (sites_file, info_file, summary_file)):
                 raise RuntimeError("SeedMatchR did not produce its expected output files")
-            with sites_file.open(newline="") as handle:
-                rows = list(csv.DictReader(handle, delimiter="\t"))
+            summary = {}
+            with summary_file.open(newline="") as handle:
+                for row in csv.DictReader(handle, delimiter="\t"):
+                    candidate = row.pop("candidate_id")
+                    if candidate not in normalized or candidate in summary:
+                        raise RuntimeError("SeedMatchR returned an inconsistent candidate summary")
+                    counts = {field: int(value) for field, value in row.items()}
+                    expected = {"off_target_genes", "off_target_transcripts", "off_target_sites",
+                                *(f"{seed}_sites" for seed in seed_classes)}
+                    if set(counts) != expected or any(value < 0 for value in counts.values()):
+                        raise RuntimeError("SeedMatchR returned invalid off-target counts")
+                    summary[candidate] = counts
+            if set(summary) != set(normalized):
+                raise RuntimeError("SeedMatchR omitted a candidate summary")
             with info_file.open(newline="") as handle:
-                provenance.update({row["key"]: row["value"] for row in csv.DictReader(handle, delimiter="\t")})
-        summary, sites = summarize_sites(
-            list(normalized), rows, transcript_gene_map, target_gene_id,
-            seed_classes=seed_classes,
-        )
-        return OffTargetResult(summary, sites if include_sites else [], provenance)
+                provenance.update({row["key"]: row["value"]
+                                   for row in csv.DictReader(handle, delimiter="\t")})
+            provenance["site_details"] = "complete" if include_sites else "not materialized; exact counts retained"
+            row_count = sum(counts["off_target_sites"] for counts in summary.values())
+            sites = OffTargetSiteStore(sites_file, row_count, owner=owner)
+            if not include_sites:
+                owner.cleanup()
+                return OffTargetResult(summary, [], provenance)
+            return OffTargetResult(summary, sites, provenance)
+        except BaseException:
+            owner.cleanup()
+            raise
+
+    @staticmethod
+    def _run_bridge(
+        command: list[str], output_file: Path, progress_file: Path, timeout: int,
+        progress: Callable[[str], None] | None,
+    ) -> None:
+        """Drain progress without buffering the process's output or blocking the UI."""
+        progress_file.touch()
+        started = time.monotonic()
+        try:
+            with output_file.open("w") as output, progress_file.open() as updates:
+                with subprocess.Popen(command, stdout=output, stderr=output, text=True) as process:
+                    try:
+                        while process.poll() is None:
+                            for message in updates:
+                                if progress is not None:
+                                    progress(message.rstrip("\n"))
+                            if time.monotonic() - started > timeout:
+                                raise RuntimeError(f"SeedMatchR exceeded its {timeout}-second time limit")
+                            time.sleep(0.15)
+                        for message in updates:
+                            if progress is not None:
+                                progress(message.rstrip("\n"))
+                    except BaseException:
+                        process.kill()
+                        process.wait()
+                        raise
+            if process.returncode:
+                detail = output_file.read_text(errors="replace").strip()[-4000:]
+                raise RuntimeError(f"SeedMatchR failed: {detail}")
+        except OSError as exc:
+            raise RuntimeError(f"Could not start SeedMatchR: {exc}") from exc
