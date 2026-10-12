@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from amir_design.candidates import reverse_complement
-from amir_design.pipeline import run_pipeline
+from amir_design.pipeline import PipelineResult, run_identifier_pipeline, run_pipeline, sort_result
 from amir_design.reports import workbook_bytes
 
 
@@ -120,3 +120,137 @@ def test_malformed_insert_is_not_treated_as_an_unavailable_template():
 
     with pytest.raises(ValueError, match="invalid template"):
         run_pipeline(TARGET, ReferenceFixture(), ScorerFixture(), RunnerFixture(), insert_builder=builder)
+
+
+class IdentifierReferenceFixture(ReferenceFixture):
+    annotation_provenance = {"source": "matching fixture GTF"}
+
+    def resolve_identifier(self, identifier):
+        assert identifier in {"target", "tx1"}
+        return {"gene_id": "target", "gene_name": "FixtureTarget",
+                "input_type": "transcript" if identifier == "tx1" else "gene",
+                "transcript_ids": ["tx1", "tx2"], "matching_transcript_ids": ["tx1"]}
+
+    def regions_for_gene(self, gene):
+        return {"tx1": {"cds": [(1, 22)], "utr3": [], "utr5": []},
+                "tx2": {"cds": [], "utr3": [], "utr5": []}}
+
+
+def test_identifier_defaults_keep_partial_coverage_with_gene_denominator_and_origins():
+    result = run_identifier_pipeline(
+        "tx1", IdentifierReferenceFixture(missing_isoform=True), ScorerFixture(), RunnerFixture(),
+    )
+    row = result.summary.iloc[0]
+    assert row.target_isoforms_covered == 1
+    assert row.target_isoforms_total == 2
+    assert row.target_isoform_coverage_fraction == 0.5
+    assert row.covered_transcript_ids == "tx1"
+    assert row.missed_transcript_ids == "tx2"
+    assert row.source_transcript_ids == "tx1"
+    assert row.source_region == "cds"
+    assert row.source_transcript_start_positions_1based == "tx1:1"
+    assert result.metadata["source_transcript_ids"] == ["tx1"]
+    assert result.metadata["input_identifier_kind"] == "transcript"
+    assert result.metadata["require_all_isoforms"] is False
+    assert result.metadata["annotation_provenance"] == IdentifierReferenceFixture.annotation_provenance
+    assert len(result.on_target_sites) == 1
+    origin = result.candidate_origins.iloc[0]
+    assert (origin.transcript_id, origin.start_1based, origin.end_1based) == ("tx1", 1, 22)
+    assert origin.target_site_dna_5to3 == TARGET
+
+
+def test_checkbox_complete_coverage_returns_valid_empty_result_without_running_external_stages():
+    result = run_identifier_pipeline(
+        "target", IdentifierReferenceFixture(missing_isoform=True), object(), object(),
+        require_all_isoforms=True,
+    )
+    assert result.status == "no_eligible_candidate"
+    assert result.metadata["require_all_isoforms"] is True
+    assert "every target isoform" in result.notices[0]
+    assert result.metadata["rejected_incomplete_isoform_coverage"] == 1
+
+
+def test_missing_selected_region_is_explicit_and_not_claimed_as_coverage_rejection():
+    result = run_identifier_pipeline(
+        "target", IdentifierReferenceFixture(), object(), object(), region="utr3",
+    )
+    assert result.status == "no_eligible_candidate"
+    assert result.metadata["source_transcript_ids"] == ["tx1", "tx2"]
+    assert result.metadata["missing_region_transcript_ids"] == ["tx1", "tx2"]
+    assert result.metadata["rejected_incomplete_isoform_coverage"] == 0
+    assert "no annotated sequence in this region" in result.notices[0]
+
+
+def test_whole_transcript_design_never_requires_or_guesses_coding_annotations():
+    class UnannotatedReference(IdentifierReferenceFixture):
+        def regions_for_gene(self, gene):
+            raise AssertionError("Whole-transcript search must not need region annotations")
+
+    result = run_identifier_pipeline(
+        "tx1", UnannotatedReference(), ScorerFixture(), RunnerFixture(), region="whole",
+    )
+    assert result.summary.iloc[0].target_isoforms_covered == 2
+    assert result.metadata["search_region"] == "whole"
+    assert result.metadata["missing_region_transcript_ids"] == []
+
+
+def test_gene_sources_include_each_isoform_but_transcript_sources_only_selected_one():
+    other = "CCGCTGCGCATATACATATATA"
+
+    class DifferentIsoforms(IdentifierReferenceFixture):
+        def transcripts_for_gene(self, gene):
+            return {"tx1": TARGET, "tx2": other}
+
+        def regions_for_gene(self, gene):
+            return {"tx1": {"cds": [(1, 22)]}, "tx2": {"cds": [(1, 22)]}}
+
+    class Scorer:
+        provenance = {"kind": "test stub"}
+
+        def score(self, targets):
+            return [0.8] * len(targets)
+
+    class Runner:
+        def screen(self, guides, fasta, gene, mapping):
+            assert gene == "target"
+            return SimpleNamespace(
+                summary={candidate: {"off_target_genes": 0, "off_target_transcripts": 0,
+                                     "off_target_sites": 0, "mer8_sites": 0}
+                         for candidate in guides},
+                sites=[], provenance={"kind": "test stub"},
+            )
+
+    gene_result = run_identifier_pipeline("target", DifferentIsoforms(), Scorer(), Runner())
+    assert set(gene_result.summary.target_site_dna_5to3) == {TARGET, other}
+    assert set(gene_result.summary.source_transcript_ids) == {"tx1", "tx2"}
+    assert list(gene_result.summary.target_isoforms_covered) == [1, 1]
+    assert list(gene_result.summary.target_isoforms_total) == [2, 2]
+    assert "mer8_sites" in gene_result.summary
+    transcript_result = run_identifier_pipeline("tx1", DifferentIsoforms(), Scorer(), Runner())
+    assert list(transcript_result.summary.target_site_dna_5to3) == [TARGET]
+    assert transcript_result.summary.iloc[0].target_isoforms_total == 2
+
+
+def test_sorting_changes_independent_order_and_report_without_changing_measurements():
+    summary = pd.DataFrame([
+        {"candidate_id": "high_activity", "predicted_efficiency_score": 0.9,
+         "off_target_genes": 10, "target_isoform_coverage_fraction": 0.5},
+        {"candidate_id": "high_coverage", "predicted_efficiency_score": 0.8,
+         "off_target_genes": 5, "target_isoform_coverage_fraction": 1.0},
+        {"candidate_id": "low_offtargets", "predicted_efficiency_score": 0.7,
+         "off_target_genes": 0, "target_isoform_coverage_fraction": 0.5},
+    ])
+    result = PipelineResult("complete", summary, pd.DataFrame(), pd.DataFrame(), {"sort_by": "old"})
+    for order, first in [("activity", "high_activity"), ("coverage", "high_coverage"),
+                         ("off_targets", "low_offtargets")]:
+        sorted_result = sort_result(result, order)
+        assert sorted_result.summary.iloc[0].candidate_id == first
+        assert sorted_result.metadata["sort_by"] == order
+        pd.testing.assert_frame_equal(
+            sorted_result.summary.sort_values("candidate_id").reset_index(drop=True),
+            summary.sort_values("candidate_id").reset_index(drop=True),
+        )
+    assert result.metadata["sort_by"] == "old"
+    assert result.summary.iloc[0].candidate_id == "high_activity"
+    with pytest.raises(ValueError, match="Unknown candidate sort"):
+        sort_result(result, "combined")

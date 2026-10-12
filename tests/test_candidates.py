@@ -2,7 +2,7 @@ import pytest
 
 from amir_design.candidates import (
     DESIGN_RULES, FIGURE_S1_RULES, normalize_cds, passes_design_rules,
-    reverse_complement, select_candidates,
+    reverse_complement, select_candidates, select_region_candidates,
 )
 
 
@@ -54,3 +54,88 @@ def test_unusable_inputs_fail_before_external_operations(text):
 def test_plain_sequence_and_single_fasta_normalize_identically():
     assert normalize_cds("\n" + TARGET.lower() + "\t") == TARGET
     assert normalize_cds(">my_cds\n" + TARGET[:10] + "\n" + TARGET[10:]) == TARGET
+
+
+def test_partial_coverage_keeps_at_least_one_isoform_and_reports_missing_ids():
+    transcripts = {"tx1": TARGET, "tx2": "ATG" * 30}
+    regions = {"tx1": [(1, 22)], "tx2": []}
+    partial = select_region_candidates(transcripts, regions)
+    assert partial.sequence_filtered_count == 1
+    assert partial.rejected_isoform_count == 0
+    assert partial.missing_region_transcript_ids == ("tx2",)
+    candidate = partial.candidates[0]
+    assert candidate.isoform_sites == {"tx1": (1,), "tx2": ()}
+    assert candidate.covered_isoforms == ("tx1",)
+    assert candidate.missed_isoforms == ("tx2",)
+    assert candidate.coverage_fraction == 0.5
+    complete = select_region_candidates(transcripts, regions, require_all_isoforms=True)
+    assert complete.sequence_filtered_count == 1
+    assert complete.rejected_isoform_count == 1
+    assert complete.candidates == []
+
+
+def test_gene_generation_deduplicates_all_transcript_origins():
+    transcripts = {"tx1": TARGET + "NNN" + TARGET, "tx2": "NN" + TARGET}
+    regions = {"tx1": [(1, 22), (26, 47)], "tx2": [(3, 24)]}
+    selection = select_region_candidates(transcripts, regions, region="utr3")
+    assert len(selection.candidates) == 1
+    candidate = selection.candidates[0]
+    assert candidate.source_sites == {"tx1": (1, 26), "tx2": (3,)}
+    assert candidate.source_region == "utr3"
+    assert candidate.cds_starts == ()
+    assert candidate.coverage_fraction == 1
+
+
+def test_transcript_generation_keeps_full_gene_denominator_and_cross_region_hits():
+    other = "CCGCTGCGCATATACATATATA"
+    transcripts = {"tx1": TARGET, "tx2": other + "NN" + TARGET, "tx3": "ATG" * 10}
+    # tx2's selected CDS contains OTHER. TARGET there lies outside that region.
+    regions = {"tx1": [(1, 22)], "tx2": [(1, 22)], "tx3": []}
+    selected = select_region_candidates(
+        transcripts, regions, generation_transcript_ids=["tx1"], region="cds",
+    )
+    assert len(selected.candidates) == 1
+    candidate = selected.candidates[0]
+    assert candidate.source_sites == {"tx1": (1,)}
+    assert candidate.covered_isoforms == ("tx1", "tx2")
+    assert candidate.missed_isoforms == ("tx3",)
+    assert candidate.isoform_sites["tx2"] == (25,)
+    assert candidate.coverage_fraction == pytest.approx(2 / 3)
+    assert selected.target_isoforms == ("tx1", "tx2", "tx3")
+    all_sources = select_region_candidates(transcripts, regions)
+    assert {candidate.target_sequence for candidate in all_sources.candidates} == {TARGET, other}
+
+
+def test_region_boundaries_exclude_partial_windows_and_include_last_full_window():
+    assert select_region_candidates({"tx": TARGET}, {"tx": [(2, 22)]}).candidates == []
+    assert select_region_candidates({"tx": TARGET}, {"tx": [(1, 21)]}).candidates == []
+    assert select_region_candidates(
+        {"tx": TARGET}, {"tx": [(1, 11), (12, 22)]},
+    ).candidates == []
+    selection = select_region_candidates({"tx": "N" + TARGET}, {"tx": [(2, 23)]})
+    assert selection.candidates[0].source_sites == {"tx": (2,)}
+
+
+def test_ambiguous_windows_only_are_skipped_and_overlapping_annotations_deduplicate():
+    sequence = "N" + TARGET
+    selection = select_region_candidates(
+        {"tx": sequence}, {"tx": [(1, 23), (1, 23)]}, region="whole",
+    )
+    assert selection.ambiguous_windows_skipped == 1
+    assert len(selection.candidates) == 1
+    assert selection.candidates[0].source_sites == {"tx": (2,)}
+
+
+@pytest.mark.parametrize("regions", [{"tx": [(0, 22)]}, {"tx": [(1, 23)]},
+                                   {"tx": [(20, 1)]}])
+def test_invalid_annotation_coordinates_fail_instead_of_silently_clipping(regions):
+    with pytest.raises(ValueError, match="Invalid cds coordinates"):
+        select_region_candidates({"tx": TARGET}, regions)
+
+
+def test_unknown_transcript_or_region_cannot_silently_change_generation_scope():
+    with pytest.raises(ValueError, match="Unknown generation transcript"):
+        select_region_candidates({"tx": TARGET}, {"tx": [(1, 22)]},
+                                 generation_transcript_ids=["missing"])
+    with pytest.raises(ValueError, match="Unknown search region"):
+        select_region_candidates({"tx": TARGET}, {"tx": [(1, 22)]}, region="intron")

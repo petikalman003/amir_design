@@ -9,6 +9,7 @@ from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
+import pandas as pd
 
 from amir_design.pipeline import PipelineResult
 
@@ -25,11 +26,13 @@ def _literal(sheet, value):
     return cell
 
 
-def _write_sheet(workbook: Workbook, title: str, frame) -> None:
+def _write_sheet(workbook: Workbook, title: str, frame, long_values: list[dict] | None = None) -> None:
     # Keep one downloadable artifact even when full-transcript sites exceed a sheet.
     if len(frame) > MAX_DATA_ROWS:
         for index, start in enumerate(range(0, len(frame), MAX_DATA_ROWS), 1):
-            _write_sheet(workbook, f"{title} {index}", frame.iloc[start:start + MAX_DATA_ROWS])
+            _write_sheet(
+                workbook, f"{title} {index}", frame.iloc[start:start + MAX_DATA_ROWS], long_values,
+            )
         return
     sheet = workbook.create_sheet(title)
     if not len(frame.columns):
@@ -45,11 +48,27 @@ def _write_sheet(workbook: Workbook, title: str, frame) -> None:
         cell.fill = PatternFill("solid", fgColor="245B55")
         headers.append(cell)
     sheet.append(headers)
-    for record in frame.itertuples(index=False, name=None):
+    for row_index, record in enumerate(frame.itertuples(index=False, name=None), 2):
         cells = []
-        for value in record:
+        for column_index, value in enumerate(record, 1):
             if hasattr(value, "item"):
                 value = value.item()
+            if isinstance(value, str) and len(value) > 32767 and long_values is not None:
+                # Gene-wide searches can yield long lists of transcript IDs or positions.
+                # Preserve every character in ordered parts and make the cell reference explicit.
+                value_id = f"value_{len(long_values) + 1:06d}"
+                parts = (len(value) + 29999) // 30000
+                for part, start in enumerate(range(0, len(value), 30000), 1):
+                    long_values.append({
+                        "value_id": value_id,
+                        "source_sheet": title,
+                        "source_cell": f"{get_column_letter(column_index)}{row_index}",
+                        "column_name": frame.columns[column_index - 1],
+                        "part": part,
+                        "parts": parts,
+                        "value_text": value[start:start + 30000],
+                    })
+                value = f"Full text recorded in Long values ({value_id})."
             # Write all text as literal data, including external gene identifiers.
             cells.append(_literal(sheet, value))
         sheet.append(cells)
@@ -57,9 +76,14 @@ def _write_sheet(workbook: Workbook, title: str, frame) -> None:
 
 def workbook_bytes(result: PipelineResult) -> bytes:
     workbook = Workbook(write_only=True)
-    _write_sheet(workbook, "Candidates", result.summary)
-    _write_sheet(workbook, "Off-target sites", result.sites)
-    _write_sheet(workbook, "Target isoform sites", result.on_target_sites)
+    long_values: list[dict] = []
+    _write_sheet(workbook, "Candidates", result.summary, long_values)
+    _write_sheet(workbook, "Off-target sites", result.sites, long_values)
+    _write_sheet(workbook, "Target isoform sites", result.on_target_sites, long_values)
+    if len(result.candidate_origins.columns):
+        _write_sheet(workbook, "Candidate origins", result.candidate_origins, long_values)
+    if long_values:
+        _write_sheet(workbook, "Long values", pd.DataFrame(long_values))
     sheet = workbook.create_sheet("Run information")
     sheet.freeze_panes = "A2"
     sheet.column_dimensions["A"].width = 40

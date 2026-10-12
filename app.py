@@ -1,4 +1,4 @@
-"""Run with ``streamlit run app.py`` from the repository root."""
+"""Run with ``python -m streamlit run app.py`` from the repository root."""
 
 from __future__ import annotations
 
@@ -8,15 +8,26 @@ import shutil
 
 import streamlit as st
 
-from amir_design.candidates import DESIGN_RULES, FIGURE_S1_RULES, normalize_cds
+from amir_design.candidates import DESIGN_RULES, FIGURE_S1_RULES
 from amir_design.offtargets import SeedMatchRunner
-from amir_design.pipeline import run_pipeline
+from amir_design.pipeline import run_identifier_pipeline, sort_result
 from amir_design.references import ReferenceBundle, ReferenceError
 from amir_design.reports import workbook_bytes
 from amir_design.scoring import ShRNAIScorer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+REGION_LABELS = {
+    "CDS only": "cds",
+    "3′ UTR only": "utr3",
+    "5′ UTR only": "utr5",
+    "Whole transcript": "whole",
+}
+SORT_LABELS = {
+    "Predicted activity": "activity",
+    "Isoform coverage": "coverage",
+    "Lowest off-target gene count": "off_targets",
+}
 
 
 @st.cache_resource
@@ -28,6 +39,8 @@ def get_scorer(path: str) -> ShRNAIScorer:
 def get_reference(path: str) -> ReferenceBundle:
     reference = ReferenceBundle.open(Path(path))
     reference.verify_integrity()
+    if reference.annotation_provenance:
+        reference.verify_annotations()
     return reference
 
 
@@ -65,7 +78,22 @@ def main() -> None:
 
     with st.form("design_form"):
         species_label = st.radio("Reference organism", ["Human", "Mouse"], horizontal=True)
-        cds = st.text_area("Target CDS", height=200, placeholder="Paste your DNA CDS sequence here")
+        identifier = st.text_input(
+            "Target gene or transcript",
+            placeholder="Enter a gene ID, transcript ID, or gene symbol",
+            help=("A gene selects candidate sites from all its annotated isoforms. A transcript "
+                  "selects sites from that transcript. Both report coverage across every "
+                  "annotated transcript of the gene. Gene symbols must identify one gene "
+                  "in the reference."),
+        )
+        region_label = st.selectbox("Candidate search region", list(REGION_LABELS))
+        require_all = st.checkbox(
+            "Require all isoforms",
+            value=False,
+            help=("If checked, keep only guides with an exact 22-base target site in every "
+                  "annotated transcript of the target gene. Otherwise keep guides covering "
+                  "at least one transcript."),
+        )
         with st.expander("Guide-selection rules"):
             rule_label = st.selectbox(
                 "Position 3 rule",
@@ -76,37 +104,44 @@ def main() -> None:
             )
         submitted = st.form_submit_button("Design and screen", type="primary")
 
-    st.caption("Candidates must cover every annotated isoform of the target gene. "
-               "Off-target screening uses exact 7- and 8-base seed matches across complete transcripts.")
+    st.caption("The search region controls where candidate sites originate. Isoform coverage "
+               "checks their exact 22-base sites anywhere in each mature transcript. "
+               "Off-target screening searches exact 7- and 8-base seed sites across full transcripts.")
 
     if submitted:
         # A failed or changed submission must not leave a previous result visible.
         st.session_state.pop("result", None)
         st.session_state.pop("workbook", None)
         st.session_state.pop("result_species", None)
+        st.session_state.pop("result_context", None)
+        st.session_state.pop("workbook_sort", None)
         species = species_label.lower()
         profile = DESIGN_RULES if rule_label.startswith("Uploaded") else FIGURE_S1_RULES
         try:
-            cds = normalize_cds(cds)
+            if not identifier.strip():
+                raise ValueError("Enter a target gene or transcript before designing guides.")
             reference = get_reference(str(reference_root / species))
             scorer = CachedScorer(str(tools_root / "shrnai"))
             runner = SeedMatchRunner(tools_root / "seedmatchr", rscript=rscript_path())
             template_path = os.environ.get("AMIR_MIRE_TEMPLATE")
             with st.status("Preparing your candidates", expanded=True) as status:
-                result = run_pipeline(
-                    cds, reference, scorer, runner, profile=profile,
+                result = run_identifier_pipeline(
+                    identifier, reference, scorer, runner,
+                    region=REGION_LABELS[region_label], require_all_isoforms=require_all,
+                    profile=profile,
                     progress=st.write,
                     template_path=Path(template_path) if template_path else None,
                 )
-                report = workbook_bytes(result)
                 label = "No eligible candidate" if result.status == "no_eligible_candidate" else "Analysis complete"
                 status.update(label=label, state="complete", expanded=False)
             st.session_state.result = result
-            st.session_state.workbook = report
             st.session_state.result_species = species
+            st.session_state.result_context = {
+                "region_label": region_label,
+                "require_all_isoforms": require_all,
+            }
         except ReferenceError as exc:
             st.error(str(exc))
-            st.info("Prepare the selected species reference using the setup instructions in README.md.")
         except (ValueError, RuntimeError, FileNotFoundError) as exc:
             st.error(str(exc))
 
@@ -117,19 +152,60 @@ def main() -> None:
     gene_id = result.metadata["target_gene_id"]
     species = st.session_state.get("result_species", "reference")
     st.subheader(f"{species.title()} · {gene_name} · {gene_id}")
+    context = st.session_state.result_context
+    isoform_count = len(result.metadata["target_isoforms"])
+    policy = "every isoform required" if context["require_all_isoforms"] else "at least one isoform required"
+    st.caption(f"Search region: {context['region_label']} · {isoform_count} annotated gene "
+               f"transcripts in the coverage denominator · {policy}.")
+    if result.metadata.get("input_identifier_kind") == "transcript":
+        source_transcripts = ", ".join(result.metadata.get("source_transcript_ids", []))
+        st.caption(f"Candidates generated from the selected transcript: {source_transcripts}.")
+    else:
+        st.caption("Candidates generated from the selected region across the gene's isoforms.")
+    missing_regions = result.metadata.get("missing_region_transcript_ids", [])
+    if missing_regions:
+        st.info(f"{len(missing_regions)} source transcripts have no annotated selected region: "
+                f"{', '.join(missing_regions)}. They remain in the isoform-coverage denominator.")
+    st.caption("Isoform coverage is a transcript count, not a prediction of expression knockdown. "
+               "The denominator includes noncoding and other annotated transcripts.")
     if result.status == "no_eligible_candidate":
         st.warning(result.notices[0])
         st.caption(f"{result.metadata['sequence_filtered_candidates']} unique candidates passed "
                    f"sequence filters; {result.metadata['rejected_incomplete_isoform_coverage']} "
-                   "were rejected for incomplete isoform coverage.")
+                   "were rejected by the isoform-coverage requirement.")
     else:
         cols = st.columns(3)
         cols[0].metric("Eligible candidates", len(result.summary))
-        cols[1].metric("Target isoforms", len(result.metadata["target_isoforms"]))
+        cols[1].metric("Target isoforms", isoform_count)
         cols[2].metric("Lowest off-target gene count", int(result.summary.off_target_genes.min()))
-        st.dataframe(result.summary, hide_index=True, use_container_width=True)
-        st.caption("Sorted by predicted activity, then off-target gene count. "
-                   "Scores are not knockdown percentages; seed counts indicate potential binding sites.")
+    sort_label = st.selectbox("Sort results by", list(SORT_LABELS), key="result_sort")
+    order = SORT_LABELS[sort_label]
+    displayed_result = sort_result(result, order=order)
+    if st.session_state.get("workbook_sort") != order:
+        st.session_state.workbook = workbook_bytes(displayed_result)
+        st.session_state.workbook_sort = order
+    if result.status != "no_eligible_candidate":
+        st.dataframe(
+            displayed_result.summary, hide_index=True, use_container_width=True,
+            column_config={
+                "predicted_efficiency_score": st.column_config.NumberColumn(
+                    "Predicted activity", format="%.4f",
+                ),
+                "target_isoforms_covered": "Isoforms covered",
+                "target_isoforms_total": "Total gene isoforms",
+                "target_isoform_coverage_fraction": st.column_config.NumberColumn(
+                    "Coverage fraction", format="%.3f",
+                    help="Fraction of annotated transcripts covered, not expression knockdown.",
+                ),
+                "off_target_genes": "Off-target genes",
+                "off_target_transcripts": "Off-target transcripts",
+                "off_target_sites": "Off-target sites",
+                "covered_transcript_ids": "Covered transcript IDs",
+                "missed_transcript_ids": "Missed transcript IDs",
+            },
+        )
+        st.caption("Scores are not knockdown percentages; seed counts indicate potential binding sites. "
+                   "The Excel download follows the selected sorting order.")
         if result.metadata.get("synthesis_status") == "template_required":
             st.warning("Mature guide sequences are available. Complete synthesis inserts require "
                        "a verified miR-E scaffold template.")
@@ -137,6 +213,11 @@ def main() -> None:
             st.dataframe(result.sites.head(10000), hide_index=True, use_container_width=True)
             if len(result.sites) > 10000:
                 st.caption("Showing the first 10,000 sites. The download contains all sites.")
+        with st.expander("Target isoform sites and candidate origins"):
+            st.write("Exact target-site occurrences across the gene's transcripts")
+            st.dataframe(result.on_target_sites, hide_index=True, use_container_width=True)
+            st.write("Sites used to generate candidates in the selected search region")
+            st.dataframe(result.candidate_origins, hide_index=True, use_container_width=True)
     st.download_button(
         "Download results and sequences", data=st.session_state.workbook,
         file_name=f"amir_{species}_{gene_name}.xlsx",

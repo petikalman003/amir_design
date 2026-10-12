@@ -72,13 +72,22 @@ for key, value in {
     text = ''.join(f'{key}={shlex.quote(str(value))}\n' if line.startswith(key + '=') else line for line in lines)
 r_launcher.write_text(text)
 multiarch = __import__('subprocess').check_output(['dpkg-architecture', '-qDEB_HOST_MULTIARCH'], text=True).strip()
+# These packages normally expose their libraries through update-alternatives.
+# Extracting .deb archives does not run that configuration step, so include the
+# actual BLAS/LAPACK package directories in our relocated R library search path.
+r_library_dirs = [
+    tree / 'usr/lib/R/lib',
+    tree / 'usr/lib' / multiarch,
+    tree / 'usr/lib' / multiarch / 'blas',
+    tree / 'usr/lib' / multiarch / 'lapack',
+]
 launcher = prefix / 'bin/Rscript'
 launcher.write_text(
     '#!/usr/bin/env bash\nset -euo pipefail\n'
     f'export R_HOME={shlex.quote(str(tree / "usr/lib/R"))}\n'
     'export RHOME="$R_HOME"\n'
     f'export R_LIBS_SITE={shlex.quote(str(tree / "usr/lib/R/site-library"))}\n'
-    f'export LD_LIBRARY_PATH={shlex.quote(str(tree / "usr/lib/R/lib") + ":" + str(tree / "usr/lib" / multiarch))}:"${{LD_LIBRARY_PATH:-}}"\n'
+    f'export LD_LIBRARY_PATH={shlex.quote(":".join(map(str, r_library_dirs)))}:"${{LD_LIBRARY_PATH:-}}"\n'
     f'exec {shlex.quote(str(tree / "usr/bin/Rscript"))} "$@"\n'
 )
 launcher.chmod(0o755)

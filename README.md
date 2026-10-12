@@ -3,18 +3,17 @@
 A Streamlit workflow connecting the uploaded Design.py selection rules,
 [shRNAI](https://github.com/ParkSJ-91/shRNAI) activity prediction, and
 [SeedMatchR](https://github.com/tacazares/SeedMatchR) full-transcript seed screening.
-Submit one CDS, select Human or Mouse, and download one Excel workbook containing
-candidate guides, predicted scores, off-target sites, target isoform coverage, and
-the reference/model provenance.
+Enter a gene or transcript ID, select Human or Mouse and a search region, and
+download one Excel workbook containing candidate guides, predicted scores,
+off-target sites, target isoform coverage, candidate origins, and reference/model
+provenance. CDS, 3′ UTR, 5′ UTR, and whole mature transcript searches are supported.
 
 ## Run
 
 From this repository, on the cloud machine's Debian 13 environment:
 
 ```bash
-bash scripts/setup.sh
-export PATH=/workspace/.runtime/bin:$PATH
-.venv/bin/python -m amir_design.reference_cli --species both --root data/references
+bash scripts/setup.sh --references
 bash scripts/start.sh
 ```
 
@@ -22,8 +21,39 @@ bash scripts/start.sh
 BLAST+ into workspace-local directories. It fetches the upstream tools at pinned
 commits, checks the shRNAI source/model hashes, and preserves existing dependency
 checkouts rather than resetting edits. `bash scripts/setup.sh --references` also
-prepares both official references. A verified published miR-E insert template is
-included in the application.
+prepares both official references and their matching GENCODE region annotations.
+Existing FASTA/SQLite/BLAST bundles are reused; region annotations are added in a
+separate checked sidecar. A verified published miR-E insert template is included
+in the application. Startup uses `python -m streamlit`, so a moved virtual
+environment's old console-script paths do not prevent startup.
+
+On NixOS, use the existing Podman Debian 13 container with your local repository
+mounted at `/workspace/amir_design`. See [LOCAL_RUN.md](LOCAL_RUN.md) for the
+copy-and-paste setup and update steps. The app source is read from that local
+folder; setup downloads runtime dependencies, pinned upstream tools, and reference
+data.
+
+## Use the form
+
+1. Select **Human** or **Mouse** and enter a gene ID or transcript ID.
+2. Select **CDS only**, **3′ UTR only**, **5′ UTR only**, or **Whole transcript**.
+3. Leave **Require all isoforms** unchecked to retain candidates covering at
+   least one annotated transcript, or check it to require every transcript.
+4. Select the design-rule profile and click **Design and screen**.
+5. Sort the results by predicted activity, isoform coverage, or off-target gene
+   count, then download the workbook. Changing the result sort reuses the analysis.
+
+A gene ID generates candidates across all its isoforms. A transcript ID generates
+candidates from that transcript only; coverage still uses every transcript of its
+gene. IDs with or without Ensembl version numbers are accepted when they identify
+one reference record. A gene symbol is also accepted when its case-insensitive
+match identifies one gene. Exact reference identifiers are preserved in the report.
+
+For example, Human `ENSG00000185962` (LCE3A), CDS only, and the default uploaded
+rules produces one candidate with an activity score near 0.4862 in the supplied
+v47 reference. Mouse `ENSMUSG00000009566` identifies Fpgs; M36 contains ten annotated
+transcripts for this gene. This is the reference's transcript count, which may
+differ from another database's or a protein-isoform count.
 
 The cloud task already has an isolated checkout. Use it directly; do not create
 a worktree for routine development. Dependencies and reference data are ignored
@@ -44,11 +74,25 @@ gene/transcript mapping, and BLAST index. Both downstream tools use the same
 reference. No canonical, protein-coding, or longest-transcript filter is applied.
 Noncoding, NMD, and retained-intron transcript records remain included.
 
-CDS mapping requires an exact full-length, plus-strand match to one gene.
-Ambiguous gene assignments and unmatched sequences stop with an explicit error.
-Every retained candidate must have its complete 22-base target site in **every
-annotated transcript of that gene**. If no candidate qualifies, the report says
-`no_eligible_candidate`; no fallback guide set is generated.
+Identifier lookup requires an unambiguous match in the selected species reference;
+unmatched identifiers and ambiguous assignments stop with an explicit error.
+Candidates are generated only within the selected regions, using strand-aware
+exon/CDS/UTR annotations from the same GENCODE release. CDS includes an annotated
+stop codon. No unannotated sequence is guessed to be a UTR. Whole transcript
+search uses complete mature transcript sequences, including noncoding transcripts.
+
+The region choice controls **candidate origin**. Coverage is the occurrence of
+the entire exact 22-base target site anywhere in each full spliced transcript;
+the site can be CDS in one isoform and UTR in another. Every annotated transcript
+of the intended gene stays in the coverage denominator, including transcripts
+without the selected region. Reported coverage is a transcript fraction, not a
+prediction of expression reduction or an expression-weighted fraction.
+
+Unchecked **Require all isoforms** retains candidates covering at least one
+transcript. Checked requires complete coverage. If no candidate qualifies under
+the chosen rules and policy, the report says `no_eligible_candidate`; no fallback
+guide set is generated. Results include exact covered and missed transcript IDs,
+the source transcript/region, and 1-based inclusive target-site coordinates.
 
 Custom full-transcript references are supported:
 
@@ -56,12 +100,18 @@ Custom full-transcript references are supported:
 export PATH=/workspace/.runtime/bin:$PATH
 .venv/bin/python -m amir_design.reference_cli --species human \
   --root /path/to/custom-references --fasta /path/to/transcripts.fa.gz \
+  --gtf /path/to/matching-annotation.gtf.gz \
   --release my-release --assembly my-assembly
 ```
 
 Headers must be official GENCODE headers or `gene_id|transcript_id|gene_symbol`.
 An optional `--sha256` checks a source-provided checksum. Existing bundles are
 verified and reused; a changed source requires a different root.
+`--gtf-sha256` optionally checks the custom annotation archive too. Custom
+references without a GTF support whole-transcript searches; CDS and UTR searches
+require matching annotated regions. Annotation preparation validates transcript
+IDs, gene assignments, exon lengths, strand, and feature coordinates against the
+stored transcripts and does not replace the base reference bundle.
 
 ## Sequence and score definitions
 
@@ -72,7 +122,7 @@ verified and reused; a changed source requires a different root.
   Supplementary Figure S1. The form exposes both profiles and records the
   selected rule. Default: uploaded Design.py rules (target position 3 is not A).
 - Every eligible unique sequence is scored; there is no early top-200/top-five
-  cutoff. Duplicate sequences retain their CDS positions.
+  cutoff. Duplicate sequences retain all their source transcript positions.
 - The real shRNAI models run on CPU using the upstream encoder and unchanged
   weights. Legacy integral float pooling settings are normalized in memory.
   The raw score is exploratory activity ranking, **not a knockdown percentage**.
@@ -92,8 +142,11 @@ verified and reused; a changed source requires a different root.
   not genomic positions. Sites indicate potential binding, not demonstrated
   off-target silencing.
 
-The report sorts by predicted activity descending, then off-target gene count
-ascending. These are separate metrics, with no arbitrary combined score.
+The default report sorts by predicted activity descending. Users can instead
+sort by isoform coverage descending or off-target gene count ascending, with
+deterministic tie-breaking. The selected sort applies to the downloadable report
+and does not rerun scoring or screening. These are separate metrics, with no
+arbitrary combined score.
 
 ## miR-E synthesis output
 
@@ -144,13 +197,15 @@ Optional variables: `AMIR_REFERENCE_ROOT` (parent containing human/mouse bundles
 PATH=/workspace/.runtime/bin:$PATH TF_CPP_MIN_LOG_LEVEL=2 \
   TF_NUM_INTRAOP_THREADS=2 TF_NUM_INTEROP_THREADS=1 \
   .venv/bin/python -m pytest -q
-.venv/bin/ruff check .
+.venv/bin/python -m ruff check .
 ```
 
 Tests execute real BLAST, real shRNAI model inference, real R/SeedMatchR searches,
 and a Streamlit submission/download using explicitly synthetic transcript
 fixtures. Fixtures are not installed as human/mouse production references.
 Scoring regression tests reproduce the upstream notebook's example scores.
+Region tests cover both strands, exon junctions, stop codons, source boundaries,
+gene/transcript lookup, partial/all-isoform coverage, and sorting without rescoring.
 Missing-template and no-shared-isoform outcomes are tested separately. Real CDS
 examples are in `examples/`: human LCE3A and mouse Krtap2-21, extracted using CDS
 coordinates in the checksum-verified official GENCODE protein-coding transcript

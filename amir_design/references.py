@@ -460,6 +460,96 @@ class ReferenceBundle:
                 )
             )
 
+    def resolve_identifier(self, identifier: str) -> dict:
+        """Resolve one exact gene/transcript ID, stable Ensembl ID, or symbol.
+
+        Versioned IDs are never silently redirected to another version. Stable
+        Ensembl IDs are accepted only when they identify one stored record;
+        symbols are compared without letter case and must also be unique.
+        """
+        identifier = identifier.strip()
+        if not identifier or any(character.isspace() for character in identifier):
+            raise ReferenceError("Enter one gene or transcript identifier, without spaces.")
+        stable_pattern = re.compile(r"^(ENS(?:MUS)?[GT]\d+)(?:\.\d+)?(_PAR_Y)?$")
+
+        def stable_id(value: str) -> str | None:
+            match = stable_pattern.fullmatch(value)
+            return match[1] + (match[2] or "") if match else None
+
+        with self._connection() as connection:
+            gene_rows = list(connection.execute(
+                "SELECT gene_id FROM genes WHERE gene_id = ?", (identifier,)
+            ))
+            transcript_rows = list(connection.execute(
+                "SELECT transcript_id, gene_id FROM transcripts WHERE transcript_id = ?",
+                (identifier,),
+            ))
+            if not gene_rows and not transcript_rows:
+                input_stable = stable_id(identifier)
+                # Only an unversioned Ensembl ID can request version resolution.
+                if input_stable == identifier:
+                    if identifier.startswith(("ENST", "ENSMUST")):
+                        transcript_rows = [
+                            row for row in connection.execute(
+                                "SELECT transcript_id, gene_id FROM transcripts WHERE transcript_id LIKE ?",
+                                (identifier.split("_PAR_Y")[0] + ".%",),
+                            ) if stable_id(row[0]) == input_stable
+                        ]
+                    else:
+                        gene_rows = [
+                            row for row in connection.execute(
+                                "SELECT gene_id FROM genes WHERE gene_id LIKE ?",
+                                (identifier.split("_PAR_Y")[0] + ".%",),
+                            ) if stable_id(row[0]) == input_stable
+                        ]
+                elif input_stable is None:
+                    gene_rows = list(connection.execute(
+                        "SELECT gene_id FROM genes WHERE gene_name = ? COLLATE NOCASE", (identifier,)
+                    ))
+            if len(gene_rows) + len(transcript_rows) > 1:
+                raise AmbiguousGeneError(
+                    f"Identifier {identifier!r} matches multiple records. Enter an exact versioned gene or transcript ID."
+                )
+            if not gene_rows and not transcript_rows:
+                raise ReferenceError(
+                    f"Identifier {identifier!r} was not found in this reference. Check species, spelling, identifier version, and reference release."
+                )
+            if transcript_rows:
+                selected_transcript, gene_id = transcript_rows[0]
+                input_type = "transcript"
+            else:
+                gene_id = gene_rows[0][0]
+                selected_transcript, input_type = None, "gene"
+            gene_name, biotype = connection.execute(
+                "SELECT gene_name, biotype FROM genes WHERE gene_id = ?", (gene_id,)
+            ).fetchone()
+            transcript_ids = [row[0] for row in connection.execute(
+                "SELECT transcript_id FROM transcripts WHERE gene_id = ? ORDER BY transcript_id",
+                (gene_id,),
+            )]
+        return {
+            "gene_id": gene_id, "gene_name": gene_name, "biotype": biotype,
+            "input_type": input_type, "transcript_ids": transcript_ids,
+            "matching_transcript_ids": [selected_transcript] if selected_transcript else transcript_ids,
+        }
+
+    @property
+    def annotation_provenance(self) -> dict:
+        """Matching region-source metadata, or an empty mapping if not installed."""
+        from .annotations import annotation_manifest
+
+        return annotation_manifest(self)
+
+    def verify_annotations(self) -> None:
+        from .annotations import verify_annotations
+
+        verify_annotations(self)
+
+    def regions_for_gene(self, gene_id: str) -> dict[str, dict[str, list[tuple[int, int]]]]:
+        from .annotations import regions_for_gene
+
+        return regions_for_gene(self, gene_id)
+
     def gene_for_cds(self, cds: str) -> dict:
         """Require an exact full-length CDS match to a single annotated gene.
 

@@ -46,5 +46,7 @@ print('Verified shRNAI models, SeedMatchR source, and native runtime.')
 PY
 if [[ "${1:-}" == "--references" ]]; then
   .venv/bin/python -m amir_design.reference_cli --species both --root data/references
+  printf 'Dependencies, species references, and CDS/UTR annotations ready. Start with bash scripts/start.sh.\n'
+else
+  printf 'Dependencies ready. Run bash scripts/setup.sh --references to prepare species data and CDS/UTR annotations, then bash scripts/start.sh.\n'
 fi
-printf 'Dependencies ready. The published miR-E insert template is included; use --references to prepare species data, then bash scripts/start.sh.\n'

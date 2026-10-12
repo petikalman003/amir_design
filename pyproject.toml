@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amir-design"
-version = "0.1.0"
+version = "0.2.0"
 description = "miR-E candidate design, shRNAI scoring, and SeedMatchR transcript screening"
 requires-python = ">=3.11,<3.12"
 dependencies = [
